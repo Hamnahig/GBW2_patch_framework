@@ -196,15 +196,17 @@ class TeamMoneyCard(tk.Frame):
     Interactive money editor for one team.
 
     Memory layout — 16-bit little-endian:
-      value = hi_byte * 256 + lo_byte   (max 65,535)
+      value = hi_byte * 65,536 + mi_byte * 256 + lo_byte   (max 99,999)
 
-      Red  : lo=0xFFE6  hi=0xFFE7
-      White: lo=0xFFE9  hi=0xFFEA
+      Red  : lo=0xFFE6  mi=0xFFE7  hi=0xFFE8
+      White: lo=0xFFE9  mi=0xFFEA  hi=0xFFEB
+      
+      hi_byte can either be 00 or 01
 
     Example: FFE9=0xF0, FFEA=0x55 → 0x55*256 + 0xF0 = 22,000
     """
 
-    MAX_VAL = 0xFFFF
+    MAX_VAL = 99_999
     PRESETS = [
         ("+1K",   +1_000),
         ("+5K",   +5_000),
@@ -215,11 +217,12 @@ class TeamMoneyCard(tk.Frame):
     ]
 
     def __init__(self, parent, team_name: str, color: str,
-                 addr_lo: int, addr_hi: int, get_emulator, **kwargs):
+                 addr_lo: int, addr_mi: int, addr_hi: int, get_emulator, **kwargs):
         super().__init__(parent, bg=CARD_BG, **kwargs)
         self._team    = team_name
         self._color   = color
         self._addr_lo = addr_lo
+        self._addr_mi = addr_mi
         self._addr_hi = addr_hi
         self._get_emu = get_emulator
         self._mode    = tk.StringVar(value="add")
@@ -305,13 +308,15 @@ class TeamMoneyCard(tk.Frame):
 
     def _read(self, pyboy) -> int:
         lo = pyboy.memory[self._addr_lo]
+        mi = pyboy.memory[self._addr_mi]
         hi = pyboy.memory[self._addr_hi]
-        return hi * 256 + lo
+        return hi * 65_536 + mi * 256 + lo
 
     def _write(self, pyboy, value: int) -> int:
         value = max(0, min(value, self.MAX_VAL))
         pyboy.memory[self._addr_lo] = value & 0xFF
-        pyboy.memory[self._addr_hi] = (value >> 8) & 0xFF
+        pyboy.memory[self._addr_mi] = (value >> 8) & 0xFF
+        pyboy.memory[self._addr_hi] = (value >> 16) & 0xFF
         return value
 
     def _apply_delta(self, delta: int):
@@ -363,6 +368,149 @@ class TeamMoneyCard(tk.Frame):
             except Exception:
                 pass
 
+    
+# ---------------------------------------------------------------------------
+# MoneyLockManager
+# ---------------------------------------------------------------------------
+
+_MONEY_HOOK_BANK = 0
+_MONEY_SUB_ADDRS = (0x750B, 0x750E, 0x7511)
+
+_RED_MONEY  = (0xFFE6, 0xFFE7, 0xFFE8)
+_WHITE_MONEY = (0xFFE9, 0xFFEA, 0xFFEB)
+
+
+class MoneyLockManager:
+    """
+    Manages the “Free Money” cheat by monitoring and correcting the in-RAM
+    money values for both teams.
+
+    The Game Boy game stores the current money values in HRAM as a 3-byte
+    little-endian integer per team:
+
+        Red team:   FFE6, FFE7, FFE8
+        White team: FFE9, FFEA, FFEB
+
+    Instead of patching the game's subtraction routine (which would affect
+    both the player and the CPU), this manager observes the money values
+    once per frame and restores them if they decrease while the cheat is
+    enabled.
+
+    Mechanism
+    ---------
+    For each team the manager stores the last known money value. During each
+    update:
+
+        1. The current money value is read from HRAM.
+        2. If the cheat is active and the value decreased since the last
+        frame, the previous value is written back.
+        3. Otherwise the stored reference value is updated.
+
+    This effectively prevents money from decreasing while still allowing
+    normal increases (income, bonuses, etc.).
+    """
+    def __init__(self):
+        self.red_free_money = False
+        self.white_free_money = False
+        self._pyboy = None
+        self._last_red = 0
+        self._last_white = 0
+
+    def register(self, pyboy):
+        self._pyboy = pyboy
+        self._last_red = self._read_money(_RED_MONEY)
+        self._last_white = self._read_money(_WHITE_MONEY)
+
+    def protect(self):
+        if not self._pyboy:
+            return
+
+        current_red = self._read_money(_RED_MONEY)
+        if self.red_free_money:
+            if current_red < self._last_red:
+                self._write_money(_RED_MONEY, self._last_red)
+                current_red = self._last_red
+        self._last_red = current_red
+
+        current_white = self._read_money(_WHITE_MONEY)
+        if self.white_free_money:
+            if current_white < self._last_white:
+                self._write_money(_WHITE_MONEY, self._last_white)
+                current_white = self._last_white
+        self._last_white = current_white
+
+    def _read_money(self, addrs):
+        lo, mi, hi = addrs
+        m = self._pyboy.memory
+        return m[lo] | (m[mi] << 8) | (m[hi] << 16)
+
+    def _write_money(self, addrs, value):
+        lo, mi, hi = addrs
+        m = self._pyboy.memory
+        m[lo] = value & 0xFF
+        m[mi] = (value >> 8) & 0xFF
+        m[hi] = (value >> 16) & 0xFF
+
+# ---------------------------------------------------------------------------
+# MoneyLockCard widget
+# ---------------------------------------------------------------------------
+
+class MoneyLockCard(tk.Frame):
+    """Per-team MoneyLock toggle card."""
+
+    def __init__(self, parent, manager: MoneyLockManager, **kwargs):
+        super().__init__(parent, bg=CARD_BG, **kwargs)
+        self._mgr       = manager
+        self._red_var   = tk.BooleanVar(value=False)
+        self._white_var = tk.BooleanVar(value=False)
+        self._build()
+
+    def _build(self):
+        self.config(pady=8, padx=10)
+
+        hdr = tk.Frame(self, bg=CARD_BG)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr, text="💰  MoneyLocking",
+            font=("Segoe UI", 10, "bold"),
+            bg=CARD_BG, fg="#a78bfa",
+        ).pack(side="left")
+
+        btn_row = tk.Frame(self, bg=CARD_BG)
+        btn_row.pack(fill="x", pady=(8, 0))
+        for label, var, color, attr in [
+            ("Red Free Money", self._red_var, "#e94560", "red_free_money"),
+            ("White Free Money", self._white_var, "#aabbdd", "white_free_money"),
+        ]:
+            self._make_toggle(btn_row, label, var, color, attr)
+
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=(8, 0))
+
+    def _make_toggle(self, parent, label, var, color, attr):
+        frame = tk.Frame(parent, bg=CARD_BG)
+        frame.pack(side="left", padx=(0, 8))
+
+        def _toggle():
+            state = var.get()
+            setattr(self._mgr, attr, state)
+            btn.config(
+                text=f"● {label}" if state else f"○ {label}",
+                bg="#1a2a1a" if state else CARD_BG,
+                fg=color if state else TEXT_DISABLED,
+            )
+            logger.info("MoneyLock %s: %s", label, "ON" if state else "OFF")
+
+        btn = tk.Checkbutton(
+            frame, text=f"○ {label}",
+            variable=var, command=_toggle,
+            font=("Segoe UI", 9, "bold"),
+            bg=CARD_BG, fg=TEXT_DISABLED,
+            activebackground=CARD_BG, activeforeground=color,
+            selectcolor=DARK_BG, indicatoron=False,
+            relief="flat", padx=10, pady=5, cursor="hand2",
+        )
+        btn.pack()
+
 
 # ---------------------------------------------------------------------------
 # Main Application Window
@@ -395,6 +543,8 @@ class GBCPatcherApp(tk.Tk):
         self._invinc_manager              = InvincibilityManager()
         self._invinc_card: Optional[InvincibilityCard] = None
         self._invinc_card_visible         = False
+
+        self._money_manager = MoneyLockManager()
 
         self._fps_frames  = 0
         self._fps_last    = time.perf_counter()
@@ -493,19 +643,28 @@ class GBCPatcherApp(tk.Tk):
             self._patch_list_frame, manager=self._invinc_manager,
         )
 
+        self._money_lock_card = MoneyLockCard(
+            self._patch_list_frame, self._money_manager
+        )
+        if not self._invinc_card_visible:
+            self._invinc_card.pack(fill="x", padx=4, pady=(4, 2))
+            self._invinc_card_visible = True
+
+            self._money_lock_card.pack(fill="x", padx=4, pady=(4, 2))
+        
         # Money cards
         get_emu = lambda: self._emulator
         self._team_cards = [
             TeamMoneyCard(
                 self._patch_list_frame,
                 team_name="Red",   color="#e94560",
-                addr_lo=0xFFE6,    addr_hi=0xFFE7,
+                addr_lo=0xFFE6,    addr_mi=0xFFE7,  addr_hi=0xFFE8,
                 get_emulator=get_emu,
             ),
             TeamMoneyCard(
                 self._patch_list_frame,
                 team_name="White", color="#aabbdd",
-                addr_lo=0xFFE9,    addr_hi=0xFFEA,
+                addr_lo=0xFFE9,    addr_mi=0xFFEA,  addr_hi=0xFFEB,
                 get_emulator=get_emu,
             ),
         ]
@@ -620,6 +779,8 @@ class GBCPatcherApp(tk.Tk):
 
         self._invinc_manager.register(self._emulator._pyboy)
 
+        self._money_manager.register(self._emulator._pyboy)
+
         if not self._invinc_card_visible:
             self._invinc_card.pack(fill="x", padx=4, pady=(4, 2))
             self._invinc_card_visible = True
@@ -644,6 +805,7 @@ class GBCPatcherApp(tk.Tk):
                 self._emulator = None
                 return
             self._render_frame()
+            self._money_manager.protect() 
             self._update_fps()
             if self._team_cards_visible:
                 for card in self._team_cards:
